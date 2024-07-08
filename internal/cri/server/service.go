@@ -185,7 +185,11 @@ func NewCRIService(options *CRIServiceOptions) (CRIService, runtime.RuntimeServi
 	labels := label.NewStore()
 	config := options.RuntimeService.Config()
 
-	podns, err := podnetwork.NewNetworkService(config.PodNetworkConfig.SocketPath, time.Second * 30)
+	podns, err := podnetwork.NewNetworkService()
+
+	if err != nil {
+		return nil, nil, err
+	}
 
 	c := &criService{
 		RuntimeService:     options.RuntimeService,
@@ -225,20 +229,24 @@ func NewCRIService(options *CRIServiceOptions) (CRIService, runtime.RuntimeServi
 
 	c.eventMonitor = events.NewEventMonitor(&criEventHandler{c: c})
 
-	c.cniNetConfMonitor = make(map[string]*cniNetConfSyncer)
-	for name, i := range c.netPlugin {
-		path := c.config.NetworkPluginConfDir
-		if name != defaultNetworkPlugin {
-			if rc, ok := c.config.Runtimes[name]; ok {
-				path = rc.NetworkPluginConfDir
+	if c.config.PodNetworkConfig.Enabled {
+		
+	} else {
+		c.cniNetConfMonitor = make(map[string]*cniNetConfSyncer)
+		for name, i := range c.netPlugin {
+			path := c.config.NetworkPluginConfDir
+			if name != defaultNetworkPlugin {
+				if rc, ok := c.config.Runtimes[name]; ok {
+					path = rc.NetworkPluginConfDir
+				}
 			}
-		}
-		if path != "" {
-			m, err := newCNINetConfSyncer(path, i, c.cniLoadOptions())
-			if err != nil {
-				return nil, nil, fmt.Errorf("failed to create cni conf monitor for %s: %w", name, err)
+			if path != "" {
+				m, err := newCNINetConfSyncer(path, i, c.cniLoadOptions())
+				if err != nil {
+					return nil, nil, fmt.Errorf("failed to create cni conf monitor for %s: %w", name, err)
+				}
+				c.cniNetConfMonitor[name] = m
 			}
-			c.cniNetConfMonitor[name] = m
 		}
 	}
 
@@ -264,31 +272,36 @@ func (c *criService) Run(ready func()) error {
 		return fmt.Errorf("failed to recover state: %w", err)
 	}
 
+	// Start CNI network conf syncers
+	cniNetConfMonitorErrCh := make(chan error, len(c.cniNetConfMonitor))
+
 	// Start event handler.
 	log.L.Info("Start event monitor")
 	eventMonitorErrCh := c.eventMonitor.Start()
 
-	// Start CNI network conf syncers
-	cniNetConfMonitorErrCh := make(chan error, len(c.cniNetConfMonitor))
-	var netSyncGroup sync.WaitGroup
-	for name, h := range c.cniNetConfMonitor {
-		netSyncGroup.Add(1)
-		log.L.Infof("Start cni network conf syncer for %s", name)
-		go func(h *cniNetConfSyncer) {
-			cniNetConfMonitorErrCh <- h.syncLoop()
-			netSyncGroup.Done()
-		}(h)
-	}
-	// For platforms that may not support CNI (darwin etc.) there's no
-	// use in launching this as `Wait` will return immediately. Further
-	// down we select on this channel along with some others to determine
-	// if we should Close() the CRI service, so closing this preemptively
-	// isn't good.
-	if len(c.cniNetConfMonitor) > 0 {
-		go func() {
-			netSyncGroup.Wait()
-			close(cniNetConfMonitorErrCh)
-		}()
+	if c.config.PodNetworkConfig.Enabled {
+		c.networkService.Connect(c.config.PodNetworkConfig.SocketPath, time.Second * 30)
+	} else {
+		var netSyncGroup sync.WaitGroup
+		for name, h := range c.cniNetConfMonitor {
+			netSyncGroup.Add(1)
+			log.L.Infof("Start cni network conf syncer for %s", name)
+			go func(h *cniNetConfSyncer) {
+				cniNetConfMonitorErrCh <- h.syncLoop()
+				netSyncGroup.Done()
+			}(h)
+		}
+		// For platforms that may not support CNI (darwin etc.) there's no
+		// use in launching this as `Wait` will return immediately. Further
+		// down we select on this channel along with some others to determine
+		// if we should Close() the CRI service, so closing this preemptively
+		// isn't good.
+		if len(c.cniNetConfMonitor) > 0 {
+			go func() {
+				netSyncGroup.Wait()
+				close(cniNetConfMonitorErrCh)
+			}()
+		}
 	}
 
 	// Start streaming server.

@@ -2,6 +2,8 @@ package podnetwork
 
 import (
 	"context"
+	"errors"
+	"os"
 	"time"
 
 	"github.com/containerd/containerd/v2/integration/remote/util"
@@ -9,11 +11,14 @@ import (
 	sandboxstore "github.com/containerd/containerd/v2/internal/cri/store/sandbox"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
 type NetworkService struct {
 	client network.NetworkServiceClient
+	connection *grpc.ClientConn
+	watch *podnetsocketSyncer
 }
 
 const (
@@ -24,7 +29,15 @@ const (
 	maxMsgSize           = 1024 * 1024 * 16
 )
 
-func NewNetworkService(endpoint string, connectionTimeout time.Duration) (*NetworkService, error) {
+func NewNetworkService() (*NetworkService, error) {
+	return nil, nil
+}
+
+func (n *NetworkService) Watcher(socketDir string) {
+	newpodnetsocketSyncer(socketDir)
+}
+
+func (n *NetworkService) Connect(endpoint string, connectionTimeout time.Duration) (*NetworkService, error) {
 	addr, dialer, err := util.GetAddressAndDialer(endpoint)
 	if err != nil {
 		return nil, err
@@ -55,12 +68,21 @@ func NewNetworkService(endpoint string, connectionTimeout time.Duration) (*Netwo
 
 	net := &NetworkService{
 		client: network.NewNetworkServiceClient(conn),
+		connection: conn,
 	}
-
+	
 	return net, nil
 }
 
-func (n * NetworkService) Attach(ctx context.Context, sandbox *sandboxstore.Sandbox) (*network.AttachInterfaceResponse, error) {
+func (n *NetworkService) Ready(path string) bool {
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) && n.connection.GetState() != connectivity.Ready{
+		return false
+	}
+
+	return true
+}
+
+func (n *NetworkService) Attach(ctx context.Context, sandbox *sandboxstore.Sandbox) (*network.AttachInterfaceResponse, error) {
 	req := &network.AttachInterfaceRequest{
 		Labels: sandbox.Config.Labels,
 		Annotations: sandbox.Config.Annotations,
@@ -73,7 +95,7 @@ func (n * NetworkService) Attach(ctx context.Context, sandbox *sandboxstore.Sand
 	return n.client.AttachInterface(ctx, req)
 }
 
-func (n * NetworkService) Detach(ctx context.Context, sandbox *sandboxstore.Sandbox) (*network.DetachInterfaceResponse, error) {
+func (n *NetworkService) Detach(ctx context.Context, sandbox *sandboxstore.Sandbox) (*network.DetachInterfaceResponse, error) {
 	req := &network.DetachInterfaceRequest{
 		Labels: sandbox.Config.Labels,
 		Annotations: sandbox.Config.Annotations,
