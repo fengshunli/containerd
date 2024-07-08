@@ -19,6 +19,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -45,7 +46,27 @@ func (c *criService) PodSandboxStatus(ctx context.Context, r *runtime.PodSandbox
 		createdAt time.Time
 		state     string
 		info      map[string]string
+		netPlugin = c.getNetworkPlugin(sandbox.RuntimeHandler)
+		id        = sandbox.ID
+		path      = sandbox.NetNSPath
+		config    = sandbox.Config
 	)
+
+	if netPlugin == nil {
+		return nil, errors.New("cni config not initialized")
+	}
+
+	opts, err := cniNamespaceOpts(id, config)
+	if err != nil {
+		return nil, fmt.Errorf("get cni namespace options: %w", err)
+	}
+
+	err = netPlugin.Check(ctx, id, path, opts...) 
+
+	if err != nil {
+		return nil, fmt.Errorf("CNI CHECK cmd failed: %w", err)
+	}
+
 	cstatus, err := c.sandboxService.SandboxStatus(ctx, sandbox.Sandboxer, sandbox.ID, r.GetVerbose())
 	if err != nil {
 		// If the shim died unexpectedly (segfault etc.) let's set the state as
